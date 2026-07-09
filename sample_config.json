@@ -1,0 +1,17 @@
+{
+  "privileged_roots": ["Admin", "Admins", "Administrators", "Privileged"],
+  "workforce_roots": ["Users", "Workforce", "Employees", "Corporate"],
+  "service_path_keywords": ["service accounts", "service account", "non-human", "application accounts"],
+  "service_name_patterns": [
+    "(^|[._\\-])svc([._\\-]|$)",
+    "(^|[._\\-])service([._\\-]|$)",
+    "^svc[._\\-]",
+    "^sa[._\\-]",
+    "^sql[._\\-]",
+    "^iis[._\\-]",
+    "^app[._\\-]",
+    "^api[._\\-]",
+    "^sync[._\\-]"
+  ],
+  "device_keywords": ["dvr", "camera", "printer", "scanner", "kiosk", "pos", "automation", "bot", "monitor"]
+}

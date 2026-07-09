@@ -1,0 +1,9 @@
+# local/private data
+private_rules.json
+*.xlsx
+!samples/*.xlsx
+output/
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
