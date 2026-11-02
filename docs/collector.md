@@ -84,11 +84,9 @@ An adjacent `.xlsx.audit.json` records run time, domain/scope, controllers, sema
 
 The script does not change execution policy, install RSAT, parallelize directory queries or modify accounts. Use an approved reporting window and pilot scope for large domains.
 
-## Verification boundary
+## Running the tests
 
-The included tests use synthetic AD cmdlet mocks and exercise the actual PowerShell workbook writer. They verify branching, aggregation, cutoff/rounding edges, empty outputs, text handling and failure behavior. Native spreadsheet rendering is a separate check. Neither form of offline verification establishes live directory permissions, observed production values or complete operational coverage.
-
-Run the suite in a fresh PowerShell process because it intentionally mocks `Import-Module` and AD cmdlets. Do not reuse that test session for directory administration.
+The test suite covers aggregation, date boundaries, empty reports, text handling and file replacement. Run it in a fresh PowerShell process: it mocks `Import-Module` and the AD cmdlets, so that session should not be reused for directory administration.
 
 ## Sources
 

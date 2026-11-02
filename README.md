@@ -102,7 +102,7 @@ See [review and remediation playbook](docs/remediation.md) before acting on a re
 - Successful queries do not guarantee attribute-level permissions are complete, nor an atomic snapshot across DCs.
 - Operational reports and audit sidecars contain sensitive identifiers. Restrict their storage, access and retention.
 
-## Verification
+## Tests
 
 Run each PowerShell fixture suite in a **fresh process**; it deliberately mocks directory cmdlets and must not be dot-sourced into an administration session:
 
@@ -117,10 +117,11 @@ python -m pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
-The tests exercise synthetic fixtures, workbook parsing/writing, classification, boundary conditions and failure paths. Offline passes do not establish behavior against a real organization's permissions, topology or historical directory state. Pilot with an approved scope and confirm findings with authoritative owners before using the output operationally.
+The tests cover workbook parsing and writing, account classification, boundary conditions and failure handling.
 
 ## Documentation
 
+- [Project article](https://www.tonymuzo.dev/blog/ad-account-hygiene-powershell-python/)
 - [Collector, attribute mapping and limitations](docs/collector.md)
 - [Human-reviewed remediation process](docs/remediation.md)
 - [Privacy and reporting policy](SECURITY.md)

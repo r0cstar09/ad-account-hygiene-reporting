@@ -18,4 +18,4 @@ For readability, the export and service views show selected columns, print layou
 
 ![Synthetic service-account review](images/03-service-review.png)
 
-These are the exact image files proposed for the accompanying article. Publication remains subject to owner approval.
+These images accompany the [project article](https://www.tonymuzo.dev/blog/ad-account-hygiene-powershell-python/).
