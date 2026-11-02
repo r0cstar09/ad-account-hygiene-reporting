@@ -121,7 +121,7 @@ The tests cover workbook parsing and writing, account classification, boundary c
 
 ## Documentation
 
-- [Project article](https://www.tonymuzo.dev/blog/ad-account-hygiene-powershell-python/)
+- [Project article](https://www.tonymuzo.dev/work/ad-account-hygiene-powershell-python/)
 - [Collector, attribute mapping and limitations](docs/collector.md)
 - [Human-reviewed remediation process](docs/remediation.md)
 - [Privacy and reporting policy](SECURITY.md)
