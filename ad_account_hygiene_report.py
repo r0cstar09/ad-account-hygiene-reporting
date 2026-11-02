@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
-import sys
-from dataclasses import dataclass
+import tempfile
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -56,13 +57,20 @@ OUTPUT_COLUMNS = [
 ]
 
 PRIORITY_ORDER = {
-    "Critical - Never Logged On": 0,
+    "Critical - Source Reports Never Logged On": 0,
     "High - 365+ days": 1,
     "Medium - 180+ days": 2,
     "Low - 90+ days": 3,
-    "Service Review - Never Logged On": 4,
-    "Service Review": 5,
+    "Needs Review - Unknown Logon Age": 4,
+    "Below Threshold - Under 90 days": 5,
+    "Service Review - Source Reports Never Logged On": 6,
+    "Service Review - Unknown Logon Age": 7,
+    "Service Review": 8,
 }
+
+UNKNOWN_DAYS = "Unknown"
+SOURCE_NEVER = "Source Reports Never Logged On"
+SOURCE_NEVER_SENTINELS = {"never", "never logged on"}
 
 
 def load_config(path: Path | None) -> dict[str, Any]:
@@ -87,7 +95,7 @@ def normalize_text(value: Any) -> str:
 def parse_canonical(canonical_name: Any, config: dict[str, Any]) -> dict[str, str]:
     """Parse Canonical Name like example.local/Users/Region/Accounts/Site/Jane Doe."""
     if canonical_name is None or pd.isna(canonical_name):
-        return {"domain": "", "root_ou": "", "base_category": "Other", "ou_path": "", "account_class": "", "site_ou": ""}
+        return {"domain": "", "root_ou": "", "base_category": "Other Accounts", "ou_path": "", "account_class": "", "site_ou": ""}
 
     parts = normalize_text(canonical_name).split("/")
     domain = parts[0] if parts else ""
@@ -128,78 +136,120 @@ def parse_canonical(canonical_name: Any, config: dict[str, Any]) -> dict[str, st
 
 
 def normalize_days(value: Any) -> Any:
-    if value is None or pd.isna(value):
-        return "Never Logged On"
+    """Normalize source evidence without treating missing data as a never-logon assertion."""
+    if value is None or pd.isna(value) or isinstance(value, bool):
+        return UNKNOWN_DAYS
     text = str(value).strip()
-    if not text or "never" in text.lower():
-        return "Never Logged On"
+    if not text:
+        return UNKNOWN_DAYS
+    if " ".join(text.casefold().split()) in SOURCE_NEVER_SENTINELS:
+        return SOURCE_NEVER
     try:
-        return int(float(text))
-    except ValueError:
-        return text
+        number = Decimal(text)
+    except InvalidOperation:
+        return UNKNOWN_DAYS
+    if not number.is_finite() or number < 0 or number != number.to_integral_value():
+        return UNKNOWN_DAYS
+    return int(number)
 
 
 def priority_and_action(days: Any, is_service: bool) -> tuple[str, str]:
+    """Assign evidence-aware review bands without inferring policy or account privilege."""
     if is_service:
-        if days == "Never Logged On":
-            return "Service Review - Never Logged On", "Validate owner, purpose, host/service dependency, and deny interactive logon if not required"
+        if days == SOURCE_NEVER:
+            return "Service Review - Source Reports Never Logged On", "Validate the source sentinel, owner, purpose, host/service dependency, and interactive-logon requirements"
+        if days == UNKNOWN_DAYS:
+            return "Service Review - Unknown Logon Age", "Resolve the unknown logon age, then validate owner, purpose, host/service dependency, and interactive-logon requirements"
         return "Service Review", "Validate owner, purpose, host/service dependency, and remove if no longer required"
-    if days == "Never Logged On":
-        return "Critical - Never Logged On", "Verify employment/start status or disable if not needed"
+    if days == SOURCE_NEVER:
+        return "Critical - Source Reports Never Logged On", "Validate the source sentinel against authoritative logon evidence, then confirm need before disablement"
+    if days == UNKNOWN_DAYS:
+        return "Needs Review - Unknown Logon Age", "Resolve the missing or invalid logon age before assigning a stale-account action"
     if isinstance(days, int) and days >= 365:
         return "High - 365+ days", "Stale enabled account; verify with owner or manager before disablement"
     if isinstance(days, int) and days >= 180:
         return "Medium - 180+ days", "Review business need and prepare disablement if no exception"
-    return "Low - 90+ days", "Monitor, validate, or stage for normal stale-account review"
+    if isinstance(days, int) and days >= 90:
+        return "Low - 90+ days", "Monitor, validate, or stage for normal stale-account review"
+    return "Below Threshold - Under 90 days", "Below the 90-day stale-age threshold; validate report scope and monitor as appropriate"
 
 
 def load_ad_report(path: Path) -> pd.DataFrame:
-    """Load a MaxPowerSoft-style Excel export with title rows before the header."""
-    raw = pd.read_excel(path, header=None)
-    first_col = raw.iloc[:, 0].astype(str).str.strip().str.lower()
+    """Load and validate a title-prefixed report without guessing malformed headers."""
+    raw = pd.read_excel(path, header=None, dtype=object)
+    if raw.empty or raw.shape[1] == 0:
+        raise ValueError("Input workbook is empty; expected title rows and a report header row.")
+    first_col = raw.iloc[:, 0].map(normalize_text).str.casefold()
     header_rows = raw.index[first_col.eq("disabled")]
     if len(header_rows) == 0:
         raise ValueError("Could not find the report header row. Expected first header cell to be 'Disabled'.")
     idx = int(header_rows[0])
-    headers = raw.iloc[idx].tolist()
-    df = raw.iloc[idx + 1 :].copy()
-    df.columns = headers
-    return df.dropna(how="all")
+    headers = [normalize_text(value) for value in raw.iloc[idx].tolist()]
+    keep_positions: list[int] = []
+    kept_headers: list[str] = []
+    for position, header in enumerate(headers):
+        if header:
+            keep_positions.append(position)
+            kept_headers.append(header)
+        elif raw.iloc[idx + 1 :, position].notna().any():
+            raise ValueError(f"Report header row contains a blank name for populated column {position + 1}.")
+    duplicates = sorted({header for header in kept_headers if kept_headers.count(header) > 1})
+    if duplicates:
+        raise ValueError(f"Report header row contains duplicate column names: {duplicates}")
+    if not kept_headers:
+        raise ValueError("Report header row contains no named columns.")
+    df = raw.iloc[idx + 1 :, keep_positions].copy()
+    df.columns = kept_headers
+    return df.dropna(how="all").reset_index(drop=True)
+
+
+def has_keyword(text: str, keyword: Any) -> bool:
+    """Match configured terms at Unicode word boundaries to avoid short substring collisions."""
+    term = normalize_text(keyword)
+    return bool(term and re.search(rf"(?<!\w){re.escape(term)}(?!\w)", text, flags=re.IGNORECASE))
 
 
 def service_account_reason(row: pd.Series, config: dict[str, Any]) -> str:
+    """Return a configurable heuristic reason, not proof of account type or privilege."""
     cols = config["columns"]
-    values = [
+    path_values = [
         row.get(cols["canonical_name"], ""),
         row.get(cols["distinguished_name"], ""),
-        row.get(cols["sam_account_name"], ""),
-        row.get(cols["display_name"], ""),
         row.get("ou_path", ""),
         row.get("account_class", ""),
         row.get("root_ou", ""),
     ]
+    values = [
+        *path_values,
+        row.get(cols["sam_account_name"], ""),
+        row.get(cols["display_name"], ""),
+    ]
+    path_haystack = " | ".join(normalize_text(v) for v in path_values)
     haystack = " | ".join(normalize_text(v).lower() for v in values)
     sam = normalize_text(row.get(cols["sam_account_name"], "")).lower()
 
     for term in config.get("service_path_keywords", []):
-        if term.lower() in haystack:
+        if has_keyword(path_haystack, term):
             return f"Service-account path keyword: {term}"
     for pattern in config.get("service_name_patterns", []):
         if re.search(pattern, sam):
             return f"Service-style SAM naming convention: {pattern}"
     for term in config.get("device_keywords", []):
-        if term.lower() in haystack:
+        if has_keyword(haystack, term):
             return f"Likely non-human/device account keyword: {term}"
     return ""
 
 
 def build_clean_frame(input_file: Path, config: dict[str, Any]) -> pd.DataFrame:
+    """Build the four-category review table after structural and evidence validation."""
     df = load_ad_report(input_file)
     cols = config["columns"]
     required = [cols[k] for k in ["canonical_name", "sam_account_name", "days_since_last_logon"]]
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"Missing required input columns: {missing}. Found: {list(df.columns)}")
+    if df.empty:
+        return pd.DataFrame(columns=OUTPUT_COLUMNS)
 
     parsed = df[cols["canonical_name"]].apply(lambda v: parse_canonical(v, config)).apply(pd.Series)
     df = pd.concat([parsed, df], axis=1)
@@ -210,6 +260,9 @@ def build_clean_frame(input_file: Path, config: dict[str, Any]) -> pd.DataFrame:
     df["Priority"] = priority.apply(lambda x: x[0])
     df["Recommended Action"] = priority.apply(lambda x: x[1])
 
+    def optional_column(name: str) -> pd.Series:
+        return df[name] if name in df.columns else pd.Series("", index=df.index, dtype=object)
+
     clean = pd.DataFrame({
         "Category": df["Category"],
         "Original Category": df["base_category"],
@@ -217,19 +270,19 @@ def build_clean_frame(input_file: Path, config: dict[str, Any]) -> pd.DataFrame:
         "Account Class": df["account_class"],
         "Site/OU": df["site_ou"],
         "OU Path": df["ou_path"],
-        "Display Name": df.get(cols["display_name"], ""),
-        "SAM Account Name": df.get(cols["sam_account_name"], ""),
-        "Account Expires On": df.get(cols["account_expires"], ""),
-        "Password Last Set": df.get(cols["password_last_set"], ""),
-        "When Created": df.get(cols["when_created"], ""),
-        "Last Logon Timestamp": df.get(cols["last_logon_timestamp"], ""),
+        "Display Name": optional_column(cols["display_name"]),
+        "SAM Account Name": optional_column(cols["sam_account_name"]),
+        "Account Expires On": optional_column(cols["account_expires"]),
+        "Password Last Set": optional_column(cols["password_last_set"]),
+        "When Created": optional_column(cols["when_created"]),
+        "Last Logon Timestamp": optional_column(cols["last_logon_timestamp"]),
         "Days Since Last Logon": df["Days Since Last Logon - Clean"],
-        "Logon Count": df.get(cols["logon_count"], ""),
+        "Logon Count": optional_column(cols["logon_count"]),
         "Priority": df["Priority"],
         "Recommended Action": df["Recommended Action"],
         "Service Account Reason": df["Service Account Reason"],
-        "Distinguished Name": df.get(cols["distinguished_name"], ""),
-        "Canonical Name": df.get(cols["canonical_name"], ""),
+        "Distinguished Name": optional_column(cols["distinguished_name"]),
+        "Canonical Name": optional_column(cols["canonical_name"]),
     })
     clean["Priority Sort"] = clean["Priority"].map(PRIORITY_ORDER).fillna(9)
     return clean.sort_values(["Priority Sort", "Category", "Site/OU", "SAM Account Name"]).drop(columns=["Priority Sort"])
@@ -237,7 +290,7 @@ def build_clean_frame(input_file: Path, config: dict[str, Any]) -> pd.DataFrame:
 
 def autosize_columns(worksheet, df: pd.DataFrame, max_width: int = 52) -> None:
     for idx, col in enumerate(df.columns):
-        series = df[col].astype(str).replace("nan", "") if len(df) else pd.Series(dtype=str)
+        series = df[col].map(lambda value: "" if pd.isna(value) else str(value)) if len(df) else pd.Series(dtype=str)
         width = min(max(series.map(len).max() if len(series) else 0, len(str(col))) + 2, max_width)
         worksheet.set_column(idx, idx, width)
 
@@ -265,17 +318,44 @@ def add_table_sheet(writer, sheet_name: str, df: pd.DataFrame, formats: dict[str
 
 
 def write_workbook(clean: pd.DataFrame, output_file: Path) -> None:
+    """Atomically replace the destination only after a complete workbook closes successfully."""
+    output_file = Path(output_file)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{output_file.name}.", suffix=".xlsx", dir=output_file.parent
+    )
+    os.close(descriptor)
+    temporary_path = Path(temporary_name)
+    try:
+        _write_workbook_contents(clean, temporary_path)
+        os.replace(temporary_path, output_file)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def _write_workbook_contents(clean: pd.DataFrame, output_file: Path) -> None:
+    """Write the dashboard and category workflow with literal-string XLSX handling."""
     category_summary = clean.groupby("Category", dropna=False).size().reset_index(name="Count").sort_values("Count", ascending=False)
     priority_summary = clean.groupby("Priority", dropna=False).size().reset_index(name="Count")
-    priority_summary["Priority Sort"] = priority_summary["Priority"].map(PRIORITY_ORDER).fillna(9)
+    priority_summary["Priority Sort"] = priority_summary["Priority"].map(PRIORITY_ORDER).fillna(99)
     priority_summary = priority_summary.sort_values("Priority Sort").drop(columns=["Priority Sort"])
     ou_summary = clean.groupby(["Category", "Account Class", "Site/OU"], dropna=False).size().reset_index(name="Count").sort_values("Count", ascending=False)
     top_ou = ou_summary.head(15).copy()
     top_ou["OU Label"] = top_ou["Category"].astype(str) + " | " + top_ou["Account Class"].astype(str) + " | " + top_ou["Site/OU"].astype(str)
 
-    output_file.parent.mkdir(parents=True, exist_ok=True)
-    with pd.ExcelWriter(output_file, engine="xlsxwriter", datetime_format="yyyy-mm-dd hh:mm:ss", date_format="yyyy-mm-dd") as writer:
+    with pd.ExcelWriter(
+        output_file,
+        engine="xlsxwriter",
+        datetime_format="yyyy-mm-dd hh:mm:ss",
+        date_format="yyyy-mm-dd",
+        engine_kwargs={"options": {"strings_to_formulas": False, "strings_to_urls": False}},
+    ) as writer:
         workbook = writer.book
+        dashboard = workbook.add_worksheet("Dashboard")
+        writer.sheets["Dashboard"] = dashboard
+        if workbook.worksheets()[0] is not dashboard:
+            raise RuntimeError("Dashboard worksheet was not created first.")
+
         formats = {
             "title": workbook.add_format({"bold": True, "font_size": 18, "font_color": "#1F4E78"}),
             "subtitle": workbook.add_format({"font_size": 10, "font_color": "#666666"}),
@@ -302,18 +382,19 @@ def write_workbook(clean: pd.DataFrame, output_file: Path) -> None:
             add_table_sheet(writer, sheet, clean[clean["Category"].eq(category)], formats)
         add_table_sheet(writer, "OU Summary", ou_summary, formats)
 
-        dashboard = workbook.add_worksheet("Dashboard")
-        writer.sheets["Dashboard"] = dashboard
         dashboard.hide_gridlines(2)
+        dashboard.set_default_row(18)
         dashboard.set_column("A:A", 3)
         dashboard.set_column("B:G", 18)
-        dashboard.set_column("I:P", 16)
-        dashboard.write("B2", "Inactive Enabled Users Review", formats["title"])
-        dashboard.write("B3", "Public-safe AD hygiene workbook: human, privileged, service, and other accounts are separated for action.", formats["subtitle"])
+        dashboard.set_column("H:H", 3)
+        dashboard.set_column("I:P", 12)
+        dashboard.merge_range("B2:G2", "Inactive Enabled Users Review", formats["title"])
+        dashboard.merge_range("B3:G3", "Provisional account categories; human approval required before changes.", formats["subtitle"])
+        dashboard.merge_range("B4:G4", "Priority and category KPIs overlap; do not add them together.", formats["subtitle"])
 
         kpis = [
             ("Total Review Items", len(clean)),
-            ("Critical", int((clean["Priority"] == "Critical - Never Logged On").sum())),
+            ("Critical", int((clean["Priority"] == "Critical - Source Reports Never Logged On").sum())),
             ("High", int((clean["Priority"] == "High - 365+ days").sum())),
             ("Medium", int((clean["Priority"] == "Medium - 180+ days").sum())),
             ("Privileged", int((clean["Category"] == "Privileged Accounts").sum())),
@@ -323,47 +404,69 @@ def write_workbook(clean: pd.DataFrame, output_file: Path) -> None:
             col = 1 + i
             dashboard.write(5, col, label, formats["kpi_label"])
             dashboard.write(6, col, value, formats["kpi_value"])
-        dashboard.write("B9", "Immediate Interpretation", formats["section"])
-        dashboard.write("B10", "Start with Critical/High human and privileged accounts. Service accounts require owner, dependency, and interactive-logon review before disablement.", formats["note"])
-        dashboard.set_row(9, 58)
+        dashboard.merge_range("B9:G9", "Review guidance", formats["section"])
+        dashboard.merge_range("B10:G12", "Review Critical/High non-service items first, but validate source evidence. Service accounts need owner and dependency checks. Labels are not disable instructions.", formats["note"])
 
         data_start = 13
-        dashboard.write(data_start, 1, "Category", formats["header"])
-        dashboard.write(data_start, 2, "Count", formats["header"])
+        dashboard.merge_range(data_start, 1, data_start, 5, "Category", formats["header"])
+        dashboard.write(data_start, 6, "Count", formats["header"])
         for r, row in enumerate(category_summary.itertuples(index=False), data_start + 1):
-            dashboard.write(r, 1, row.Category)
-            dashboard.write(r, 2, int(row.Count))
+            dashboard.merge_range(r, 1, r, 5, row.Category)
+            dashboard.write(r, 6, int(row.Count))
 
-        priority_start = data_start
-        dashboard.write(priority_start, 4, "Priority", formats["header"])
-        dashboard.write(priority_start, 5, "Count", formats["header"])
+        priority_start = 20
+        dashboard.merge_range(priority_start, 1, priority_start, 5, "Review priority", formats["header"])
+        dashboard.write(priority_start, 6, "Count", formats["header"])
         for r, row in enumerate(priority_summary.itertuples(index=False), priority_start + 1):
-            dashboard.write(r, 4, row.Priority)
-            dashboard.write(r, 5, int(row.Count))
+            dashboard.merge_range(r, 1, r, 5, row.Priority)
+            dashboard.write(r, 6, int(row.Count))
 
-        ou_start = data_start + max(len(category_summary), len(priority_summary)) + 4
-        dashboard.write(ou_start, 1, "Top OU / Account Class", formats["header"])
-        dashboard.write(ou_start, 2, "Count", formats["header"])
-        for r, row in enumerate(top_ou.itertuples(index=False), ou_start + 1):
-            dashboard.write(r, 1, getattr(row, "_4"))
-            dashboard.write(r, 2, int(row.Count))
+        ou_start = max(33, priority_start + len(priority_summary) + 3)
+        dashboard.merge_range(ou_start, 1, ou_start, 5, "Top OU / account class", formats["header"])
+        dashboard.write(ou_start, 6, "Count", formats["header"])
+        for r, (label, count) in enumerate(
+            top_ou[["OU Label", "Count"]].itertuples(index=False, name=None), ou_start + 1
+        ):
+            dashboard.merge_range(r, 1, r, 5, label, formats["note"])
+            dashboard.set_row(r, 28)
+            dashboard.write(r, 6, int(count))
 
+        bottom_chart_row = ou_start + len(top_ou) + 3
         charts = [
-            ("column", "Accounts by Category", data_start + 1, 1, data_start + len(category_summary), 1, data_start + 1, 2, data_start + len(category_summary), 2, "I2", "#5B9BD5"),
-            ("bar", "Accounts by Priority", priority_start + 1, 4, priority_start + len(priority_summary), 4, priority_start + 1, 5, priority_start + len(priority_summary), 5, "I20", "#ED7D31"),
-            ("bar", "Top OU / Account Class Buckets", ou_start + 1, 1, ou_start + len(top_ou), 1, ou_start + 1, 2, ou_start + len(top_ou), 2, "B32", "#70AD47"),
+            ("column", "Accounts by Category", data_start + 1, data_start + len(category_summary), "I2", "#5B9BD5", len(category_summary), 570, 310),
+            ("bar", "Accounts by Priority", priority_start + 1, priority_start + len(priority_summary), "I18", "#ED7D31", len(priority_summary), 570, 380),
+            ("bar", "Top OU / Account Class Buckets", ou_start + 1, ou_start + len(top_ou), f"B{bottom_chart_row + 1}", "#70AD47", len(top_ou), 1280, 350),
         ]
-        for chart_type, title, c1r1, c1c1, c1r2, c1c2, vr1, vc1, vr2, vc2, cell, color in charts:
+        for chart_type, title, start, end, cell, color, row_count, width, height in charts:
+            if row_count == 0:
+                continue
             chart = workbook.add_chart({"type": chart_type})
-            chart.add_series({"name": title, "categories": ["Dashboard", c1r1, c1c1, c1r2, c1c2], "values": ["Dashboard", vr1, vc1, vr2, vc2], "fill": {"color": color}, "data_labels": {"value": True}})
+            chart.add_series({"name": title, "categories": ["Dashboard", start, 1, end, 1], "values": ["Dashboard", start, 6, end, 6], "fill": {"color": color}, "data_labels": {"value": True}})
             chart.set_title({"name": title})
             chart.set_legend({"none": True})
-            dashboard.insert_chart(cell, chart, {"x_scale": 1.1 if cell != "B32" else 1.85, "y_scale": 1.2 if cell != "B32" else 1.55})
+            chart.set_size({"width": width, "height": height})
+            if chart_type == "bar":
+                chart.set_y_axis({"num_font": {"size": 9}})
+                chart.set_plotarea({"layout": {"x": 0.51 if cell == "I18" else 0.36, "y": 0.13, "width": 0.44 if cell == "I18" else 0.60, "height": 0.75}})
+            dashboard.insert_chart(cell, chart)
+        dashboard.set_landscape()
+        dashboard.fit_to_pages(1, 1)
+        dashboard.print_area(0, 0, bottom_chart_row + 17, 15)
+        dashboard.activate()
+
+
+def ensure_distinct_paths(input_file: Path, output_file: Path) -> None:
+    """Reject identical, symlinked, or hard-linked paths before reading or writing report data."""
+    input_resolved = input_file.expanduser().resolve(strict=False)
+    output_resolved = output_file.expanduser().resolve(strict=False)
+    same_file = input_resolved == output_resolved
+    if not same_file and input_file.exists() and output_file.exists():
         try:
-            workbook.worksheets_objs.insert(0, workbook.worksheets_objs.pop(workbook.worksheets_objs.index(dashboard)))
-            dashboard.activate()
-        except Exception:
-            pass
+            same_file = os.path.samefile(input_file, output_file)
+        except OSError as exc:
+            raise ValueError(f"Could not safely compare input and output paths: {exc}") from exc
+    if same_file:
+        raise ValueError("Input and output paths must be different; refusing to overwrite the source workbook.")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -375,6 +478,7 @@ def main(argv: list[str] | None = None) -> int:
 
     config = load_config(args.config)
     output = args.output or args.input.with_name(args.input.stem + "_action_review.xlsx")
+    ensure_distinct_paths(args.input, output)
     clean = build_clean_frame(args.input, config)
     write_workbook(clean, output)
     print(f"review_items={len(clean)}")

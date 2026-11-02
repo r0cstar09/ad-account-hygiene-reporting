@@ -1,9 +1,17 @@
-# local/private data
+# Never commit operational reports, real data or local rules.
 private_rules.json
+*_private.json
 *.xlsx
-!samples/*.xlsx
+*.xls
+*.xlsm
+*.csv
+*.xlsx.audit.json
 output/
+test-output/
 .venv/
 __pycache__/
 *.pyc
+.pytest_cache/
 .DS_Store
+.env
+.env.*
